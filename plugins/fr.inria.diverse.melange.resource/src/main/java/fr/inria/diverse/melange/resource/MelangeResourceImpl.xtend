@@ -1,3 +1,13 @@
+/*******************************************************************************
+ * Copyright (c) 2017 Inria and others.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * Contributors:
+ *     Inria - initial API and implementation
+ *******************************************************************************/
 package fr.inria.diverse.melange.resource
 
 import fr.inria.diverse.melange.adapters.EObjectAdapter
@@ -6,7 +16,6 @@ import fr.inria.diverse.melange.metamodel.melange.ModelTypingSpace
 import fr.inria.diverse.melange.resource.MelangeRegistry.LanguageDescriptor
 import fr.inria.diverse.melange.resource.loader.ModelCopier
 import java.util.HashSet
-import java.util.Map
 import java.util.Set
 import org.eclipse.core.runtime.Platform
 import org.eclipse.emf.common.notify.Notification
@@ -16,6 +25,7 @@ import org.eclipse.emf.common.util.URI
 import org.eclipse.emf.ecore.EObject
 import org.eclipse.emf.ecore.EPackage
 import org.eclipse.emf.ecore.resource.Resource
+import org.eclipse.emf.ecore.resource.ResourceSet
 import org.eclipse.emf.ecore.resource.impl.ResourceSetImpl
 import org.eclipse.emf.ecore.util.EcoreUtil
 import org.eclipse.xtend.lib.annotations.Delegate
@@ -30,11 +40,14 @@ class MelangeResourceImpl implements MelangeResource {
 	String expectedLang
 	URI melangeUri
 	Resource contentResource
-	Map<EObject, EObject> wrappedToContentMapping
+	ModelCopier copier
 
 	new(URI uri) {
-		// FIXME: Retrieve the currently-used one
-		val rs = new ResourceSetImpl
+		// FIXME: Retrieve the currently-used resourceset
+		this(new ResourceSetImpl, uri)
+	}
+
+	new(ResourceSet rs, URI uri) {
 		val query = uri.query
 		val SEPARATOR = "&|;"
 		val pairs = query?.split(SEPARATOR)
@@ -44,6 +57,11 @@ class MelangeResourceImpl implements MelangeResource {
 
 		melangeUri = uri
 		wrappedResource = rs.getResource(MelangeResourceUtils.melangeToFallbackURI(uri), true) as Resource.Internal
+	}
+
+	new(ResourceSet set, URI uri, ModelCopier copier) {
+		this(set, uri)
+		this.copier = copier
 	}
 
 	override Resource getWrappedResource() {
@@ -72,6 +90,8 @@ class MelangeResourceImpl implements MelangeResource {
 	}
 
 	override getEObject(String uriFragment) {
+		if (contentResource === null)
+			doAdapt()
 		return contentResource.getEObject(uriFragment)
 	}
 
@@ -143,7 +163,8 @@ class MelangeResourceImpl implements MelangeResource {
 				val actualPkg = EPackage.Registry.INSTANCE.getEPackage(actualLanguage.uri)
 				val expectedPkg = loadXmofMM(xmofURI)
 
-				val copier = new ModelCopier(#[actualPkg].toSet, expectedPkg, true)
+				if (copier == null)
+					copier = new ModelCopier(#[actualPkg].toSet, expectedPkg, true)
 				return copier.recursiveClone(adaptedResource)
 			} else {
 				// Nothing to do
@@ -160,8 +181,8 @@ class MelangeResourceImpl implements MelangeResource {
 					loadXmofMM(xmofURI)
 				else
 					#[EPackage.Registry.INSTANCE.getEPackage(expectedLanguage.uri)].toSet
-
-			val copier = new ModelCopier(#[actualPkg].toSet, expectedPkg, xmofURI !== null)
+			if (copier == null)
+				copier = new ModelCopier(#[actualPkg].toSet, expectedPkg, xmofURI !== null)
 			return copier.recursiveClone(
 				adaptedResource)
 		} else
@@ -179,12 +200,28 @@ class MelangeResourceImpl implements MelangeResource {
 		val allRes = new HashSet<Resource>()
 		collectRelatedResources(res, allRes)
 		allRes.remove(res)
-		allRes.forEach [ r |
-			val copy = copier.clone(r)
-			addToResourceSet(copy)
-		]
+
+		// For each related resource, a MelangeResource is created
+		for (r : allRes) {
+			// Prepare the URI of the MelangeResource
+			var newMelangeURIString = r.URI.toString.replaceFirst("platform:/", "melange:/");
+			if (!expectedLang.isNullOrEmpty) {
+				newMelangeURIString = newMelangeURIString + "?lang=" + expectedLang
+			} else if (!expectedMt.isNullOrEmpty) {
+				newMelangeURIString = newMelangeURIString + "?mt=" + expectedMt
+			}
+			val newMelangeURI = URI::createURI(newMelangeURIString)
+			// If the MelangeResource already exists, we reuse it
+			var existingMelangeResource = this.resourceSet.resources.findFirst[it.URI.equals(newMelangeURI)]
+
+			// Otherwise, we create it
+			if (existingMelangeResource == null) {
+				existingMelangeResource = new MelangeResourceImpl(this.resourceSet, newMelangeURI, copier)
+				addToResourceSet(existingMelangeResource)
+			}
+		}
 		val result = copier.clone(res)
-		wrappedToContentMapping = copier.modelsMapping.immutableCopy
+
 		return result
 	}
 
@@ -284,6 +321,9 @@ class MelangeResourceImpl implements MelangeResource {
 	private def void addToResourceSet(Resource res) {
 		if (this.resourceSet != null && res != null) {
 			if (!this.resourceSet.resources.contains(res)) {
+				if (this.resourceSet.resources.exists[it.URI.equals(res.URI)]) {
+					throw new Exception("INTERNAL ERROR: resource already loaded?!")
+				}
 				this.resourceSet.resources.add(res)
 			}
 		}
@@ -322,7 +362,7 @@ class MelangeResourceImpl implements MelangeResource {
 	}
 
 	override getModelsMapping() {
-		return wrappedToContentMapping
+		return copier.modelsMapping
 	}
 
 }
